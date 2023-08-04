@@ -7,57 +7,42 @@ use std::{
     process,
 };
 
-use ansi_colors_macro::ansi_string;
-use git2::{Direction, Repository};
+use git2::Repository;
 use regex::Regex;
-use sys_locale::get_locale;
-use terminal_emoji::Emoji;
 
-const SEMVER_RX: &str = r"(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)";
+mod messages;
 
-// bitmask for simplicity :^)
 const PATCH_BUMP: u8 = 1 << 1;
 const MINOR_BUMP: u8 = 1 << 2;
 const MAJOR_BUMP: u8 = 1 << 3;
 
-/// A symbol used for indicating error messages.
-pub const ERROR_SYMBOL: Emoji = Emoji::new(ansi_string!("{red ✖}"), ansi_string!("{red ×}"));
-/// A symbol used for indicating additional information to the user.
-pub const INFO_SYMBOL: Emoji = Emoji::new(ansi_string!("{blue ℹ}"), ansi_string!("{blue i}"));
-/// A symbol used for indicating a successful operation.
-pub const SUCCESS_SYMBOL: Emoji = Emoji::new(ansi_string!("{green ✔}"), ansi_string!("{green √}"));
-/// A symbol used to indicate a recoverable error.
-pub const WARNING_SYMBOL: Emoji =
-    Emoji::new(ansi_string!("{yellow ⚠}"), ansi_string!("{yellow ‼}"));
-/// A symbol used to indicate a recoverable error.
-pub const UNKNOWN_SYMBOL: Emoji = Emoji::new(ansi_string!("{gray ?}"), ansi_string!("{gray ?}"));
-
-#[cached::proc_macro::once]
-fn locale() -> String {
-    return get_locale().unwrap_or_else(|| String::from("en-US"));
-}
-
 fn main() {
+    if env::args().any(|arg| arg == "-h" || arg == "--help") {
+        messages::usage();
+        process::exit(0);
+    }
+
+    if env::args().any(|arg| arg == "--version") {
+        messages::version();
+        process::exit(0);
+    }
+
     // check if we are in a git repository
-    let repo = match env::current_dir() {
-        Ok(path) => {
-            if let Ok(repo) = Repository::discover(path) {
-                repo
-            } else {
+    let repo = env::current_dir()
+        .map_err(|err| {
+            eprintln!("Could not get working directory: {:?}", err);
+            process::exit(1);
+        })
+        .and_then(|path| {
+            Repository::discover(path).map_err(|_| {
                 eprintln!("Not in a git repository");
                 process::exit(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("Could not get current_dir: {:?}", e);
-            process::exit(1);
-        }
-    };
+            })
+        })
+        .unwrap();
 
     // find maximum/latest semver
-    let all_tags = if let Ok(tags) = tags(&repo) {
-        semver(&tags)
-    } else {
+    let Ok(all_tags) = tags(&repo).map(|tags| semver(&tags)) else {
         eprintln!("Could not get tags from repo: git tag -l");
         process::exit(1);
     };
@@ -67,14 +52,7 @@ fn main() {
         tag(&repo, "v0.0.1", "Initial release")
             .map_err(|err| match (err.class(), err.code()) {
                 (git2::ErrorClass::Reference, git2::ErrorCode::NotFound) => {
-                    eprintln!(
-                        "{} {}",
-                        ERROR_SYMBOL,
-                        match locale().as_str() {
-                            "ru-RU" => "Сделайте хотя бы один коммит. HEAD не был найден",
-                            _ => "Make at least one commit. HEAD was not found",
-                        }
-                    );
+                    messages::not_enough_commits();
                     process::exit(1);
                 }
                 err => {
@@ -84,13 +62,14 @@ fn main() {
             })
             .unwrap();
 
+        messages::initial_tag_created();
         process::exit(0);
     }
 
-    let start_rev = &all_tags[0].0;
-    let end_rev = "HEAD";
+    let start_rev: String = all_tags[0].clone().0;
+    let end_rev: String = String::from("HEAD");
 
-    let commits = match get_commits_between_tags(&repo, start_rev, end_rev) {
+    let commits = match get_commits_between_tags(&repo, start_rev.as_str(), end_rev.as_str()) {
         Ok(commits) => commits,
         Err(e) => {
             eprintln!("Could not get commits between tags: {:?}", e);
@@ -106,24 +85,7 @@ fn main() {
         if env::args().any(|item| item == "--force" || item == "-f") {
             bumps |= PATCH_BUMP
         } else {
-            eprintln!(
-                "⚠️ {} {} {} {}\n{} {}",
-                match locale().as_str() {
-                    "ru-RU" => "Нет коммитов между",
-                    _ => "No commits between",
-                },
-                start_rev,
-                match locale().as_str() {
-                    "ru-RU" => "и",
-                    _ => "and",
-                },
-                end_rev,
-                INFO_SYMBOL,
-                match locale().as_str() {
-                    "ru-RU" => "Чтобы создать пустой тэг, используйте флаг --force или -f",
-                    _ => "If you want to create empty tag use --force or -f flag",
-                },
-            );
+            messages::no_commits_between_refs(start_rev, end_rev);
 
             process::exit(1);
         }
@@ -140,18 +102,19 @@ fn main() {
             break;
         }
 
-        if commit.starts_with("chore")
-            || commit.starts_with("fix")
-            || commit.starts_with("docs")
-            || commit.starts_with("refactor")
+        // Does not include `docs` here, because usually changes
+        // in documentation does not affect main source code
+        // and not require version bump.
+        if ["chore", "fix", "refactor"]
+            .iter()
+            .any(|t| commit.starts_with(t))
         {
             bumps |= PATCH_BUMP;
             break;
         }
     }
 
-    let latest_tag = &all_tags[0];
-    let new_tag = bump(bumps, latest_tag.1 .0, latest_tag.1 .1, latest_tag.1 .2);
+    let new_tag = bump(bumps, all_tags[0].1);
 
     if let Err(e) = prepend_string_to_file(
         "CHANGELOG.md",
@@ -175,14 +138,7 @@ fn main() {
         process::exit(1);
     }
 
-    println!(
-        "{} {}",
-        SUCCESS_SYMBOL,
-        match locale().as_str() {
-            "ru-RU" => "вписываем дополнения в CHANGELOG.md",
-            _ => "outputting changes to CHANGELOG.md",
-        }
-    );
+    messages::write_changelog();
 
     fn commit_version_changes(
         repo: &Repository,
@@ -253,27 +209,11 @@ fn main() {
         })
         .unwrap();
 
-    println!(
-        "{} {} {}",
-        SUCCESS_SYMBOL,
-        match locale().as_str() {
-            "ru-RU" => "коммитим",
-            _ => "committing",
-        },
-        changed_files_str
-    );
+    messages::committing_files(changed_files_str);
 
     match tag(&repo, &new_tag, "Release") {
         Ok(_) => {
-            println!(
-                "{} {} {}",
-                SUCCESS_SYMBOL,
-                match locale().as_str() {
-                    "ru-RU" => "создаем тег",
-                    _ => "tagging release",
-                },
-                new_tag
-            );
+            messages::tag_created(new_tag);
         }
 
         Err(e) => {
@@ -282,33 +222,18 @@ fn main() {
         }
     }
 
-    println!(
-        "{} {} `git push --follow-tags origin master`",
-        INFO_SYMBOL,
-        match locale().as_str() {
-            "ru-RU" => "Чтобы отправить изменения, запустите:",
-            _ => "To publish, run:",
-        }
-    );
+    messages::push_changes_hint();
 
     if env::args().any(|item| item == "--push" || item == "-p") {
         let mut remote = match repo.find_remote("origin") {
             Ok(remote) => remote,
             Err(_) => {
-                eprintln!(
-                    "{} {}",
-                    ERROR_SYMBOL,
-                    match locale().as_str() {
-                        "ru-RU" => "Удаленный репозиторий `origin` не найден",
-                        _ => "Remote with name `origin` was not found",
-                    }
-                );
-
+                messages::origin_not_found();
                 process::exit(1);
             }
         };
 
-        remote.connect(Direction::Push).unwrap();
+        remote.connect(git2::Direction::Push).unwrap();
 
         remote
             .push(&["refs/heads/master:refs/heads/master"], None)
@@ -350,35 +275,19 @@ fn write_version_by_regex(
 
             if !p.exists() {
                 if env::args().any(|item| item == "--verbose" || item == "-v") {
-                    eprintln!(
-                        "{} {} `{}`, {}",
-                        WARNING_SYMBOL,
-                        match locale().as_str() {
-                            "ru-RU" => "пытались обновить файл",
-                            _ => "tried to update the file",
-                        },
-                        path,
-                        match locale().as_str() {
-                            "ru-RU" => "но не нашли",
-                            _ => "but couldn't find it",
-                        }
-                    )
+                    messages::file_not_found(path);
                 }
 
+                // There is default paths for package.json and composer.json
+                // so, if project does not contain these files, we just skip them
+                // and do not stop executing.
                 continue;
             }
 
             if !p.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    format!(
-                        "`{}` {}",
-                        path,
-                        match locale().as_str() {
-                            "ru-RU" => "не является файлом",
-                            _ => "is not a file",
-                        }
-                    ),
+                    format!("`{}` is not a file!", path),
                 ));
             }
 
@@ -387,35 +296,16 @@ fn write_version_by_regex(
             file.read_to_string(&mut buf)?;
 
             if !re.is_match(&buf) {
-                eprintln!(
-                    "{} {} `{}` {}",
-                    WARNING_SYMBOL,
-                    match locale().as_str() {
-                        "ru-RU" => "файл",
-                        _ => "file",
-                    },
-                    path,
-                    match locale().as_str() {
-                        "ru-RU" => "не содержит строчки с версией",
-                        _ => "does not contain line with version",
-                    }
-                );
+                messages::version_regex_not_match(path);
 
+                // "continue" is here because user may not have a version in his file.
                 continue;
             }
 
             file.seek(io::SeekFrom::Start(0))?;
             file.write_all(re.replace(&buf, &to).as_bytes())?;
 
-            println!(
-                "{} {} {}",
-                SUCCESS_SYMBOL,
-                match locale().as_str() {
-                    "ru-RU" => "изменяем версию в",
-                    _ => "changing version in",
-                },
-                path
-            );
+            messages::file_version_changed(path);
 
             changed_in.push(path.to_string());
         }
@@ -427,14 +317,12 @@ fn write_version_by_regex(
         serde_json::Value::Array(many) => {
             set_version(many.iter().filter_map(|v| v.as_str()).collect())
         }
+
         serde_json::Value::String(file) => set_version(vec![file.as_str()]),
         serde_json::Value::Null => Ok(Vec::new()),
 
         _ => {
-            eprintln!(
-                "`{}` config in .versionrc should be an array<string> or a string",
-                files.to_string()
-            );
+            messages::path_in_config_is_invalid(files);
             process::exit(1);
         }
     }
@@ -503,6 +391,9 @@ fn tags(repo: &Repository) -> Result<BTreeSet<String>, git2::Error> {
     Ok(tags)
 }
 
+const SEMVER_RX: &str = r"(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)";
+
+/// Converts all tags to (tag, (major, minor, patch)) representation
 fn semver(tags: &BTreeSet<String>) -> Vec<(String, (usize, usize, usize))> {
     let re = Regex::new(SEMVER_RX).unwrap();
     let mut versions: Vec<(String, (usize, usize, usize))> = Vec::new();
@@ -547,6 +438,9 @@ const CONVENTIONAL_COMMIT_RX: &str = r"^(?P<type>fix|feat|docs|refactor|chore|re
 
 fn make_changelog(commits: Vec<(String, String)>) -> String {
     let mut sorted_commits = commits.clone();
+
+    // Sorting commits here, because in changelog we wants
+    // always same order of headers: feat, fix, chore
     sort_commits(&mut sorted_commits);
 
     let conventional_rx = Regex::new(CONVENTIONAL_COMMIT_RX).unwrap();
@@ -641,7 +535,7 @@ fn tag(repo: &Repository, tag: &str, message: &str) -> Result<git2::Oid, git2::E
 }
 
 // return string containing new semver and optional the current semver
-fn bump(version: u8, major: usize, minor: usize, patch: usize) -> String {
+fn bump(version: u8, (major, minor, patch): (usize, usize, usize)) -> String {
     if MAJOR_BUMP & version == MAJOR_BUMP {
         format!("v{}.{}.{}", major + 1, 0, 0)
     } else if MINOR_BUMP & version == MINOR_BUMP {
@@ -655,7 +549,10 @@ fn bump(version: u8, major: usize, minor: usize, patch: usize) -> String {
 
 #[test]
 fn test_bump() {
-    assert_eq!(bump(PATCH_BUMP, 1, 0, 0), "v1.0.1");
-    assert_eq!(bump(MINOR_BUMP, 1, 0, 0), "v1.1.0");
-    assert_eq!(bump(MAJOR_BUMP, 1, 0, 0), "v2.0.0");
+    assert_eq!(bump(PATCH_BUMP, (1, 0, 0)), "v1.0.1");
+    assert_eq!(bump(MINOR_BUMP, (1, 0, 0)), "v1.1.0");
+    assert_eq!(bump(MAJOR_BUMP, (1, 0, 0)), "v2.0.0");
+    assert_eq!(bump(PATCH_BUMP, (1, 0, 99)), "v1.0.100");
+    assert_eq!(bump(MINOR_BUMP, (1, 99, 1)), "v1.100.0");
+    assert_eq!(bump(MAJOR_BUMP, (99, 99, 99)), "v100.0.0");
 }
